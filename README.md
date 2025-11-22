@@ -13,7 +13,7 @@
 **ConcurrentList** is a collection of concurrent linked-list implementations in modern C++.  
 Each implementation demonstrates a different synchronization technique, ranging from coarse-grained locks to fully lock-free algorithms.
 
-If you have questions or would like to discuss the project, feel free to reach out here on GitHub or on **Discord: `icantcode#7527`**.
+If you have questions or would like to discuss the project, feel free to reach out here on GitHub or on **Discord: `@v0.3`**.
 
 ---
 
