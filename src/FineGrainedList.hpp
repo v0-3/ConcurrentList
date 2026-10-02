@@ -2,19 +2,19 @@
  * Luis Maya Aranda
  *
  * Fine-Grained Synchronization Linked List
- * We can improve concurrency by locking individual nodes, rather than
- * locking the list as a whole. Instead of placing a lock on the entire list
- * let us add a lock to each node. As a thread traverses the list, it locks
- * each node when it first visits, and sometime later releases it. Such
- * fine-grained locking permits concurrent threads to traverse the list
- * together in a pipelined fashion.
+ * Forward readers lock consecutive nodes in list order. Writers protect
+ * the back endpoint with the tail sentinel's lock, then lock the affected
+ * nodes in forward order. Readers never acquire the tail sentinel's lock.
  *
  * **********************************************************************/
 #pragma once
 
 #include <atomic>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 template <class T>
 class FineGrainedList {
@@ -38,125 +38,141 @@ class FineGrainedList {
         mutable std::mutex lock;
 
         Node() : key(T()), prev(nullptr), next(nullptr) {}
-        Node(T key) : key(key), prev(nullptr), next(nullptr) {}
-        Node(T key, Node *prev, Node *next) : key(key), prev(prev), next(next) {}
+        Node(const T &key) : key(key), prev(nullptr), next(nullptr) {}
     };
-    atomic<int> list_size;
+    std::atomic<int> list_size;
     Node *head;
     Node *tail;
     void delete_list();
 };
 
 template <class T>
-FineGrainedList<T>::FineGrainedList() {
-    head = new Node();
-    tail = new Node();
-    head->next = tail;
-    tail->prev = head;
+FineGrainedList<T>::FineGrainedList() : list_size(0) {
+    std::unique_ptr<Node> first(new Node());
+    std::unique_ptr<Node> last(new Node());
+    first->next = last.get();
+    last->prev = first.get();
+    head = first.release();
+    tail = last.release();
 }
 
 template <class T>
 FineGrainedList<T>::~FineGrainedList() {
-    deleteList();
+    // As with standard containers, destruction requires no concurrent callers.
+    delete_list();
 }
 
 template <class T>
 T FineGrainedList<T>::front() const {
-    if (head->next) {
-        std::lock_guard<std::mutex> guard(head->next);
-        return head->next->key;
+    std::unique_lock<std::mutex> head_guard(head->lock);
+    Node *first = head->next;
+    if (first == tail) {
+        return T();
     }
-    return T();
+    std::lock_guard<std::mutex> first_guard(first->lock);
+    head_guard.unlock();
+    return first->key;
 }
 
 template <class T>
 T FineGrainedList<T>::back() const {
-    if (tail) {
-        std::lock_guard<std::mutex> guard(tail);
-        return tail->key;
+    std::lock_guard<std::mutex> tail_guard(tail->lock);
+    Node *last = tail->prev;
+    if (last == head) {
+        return T();
     }
-    return T();
+    std::lock_guard<std::mutex> last_guard(last->lock);
+    return last->key;
 }
 
 template <class T>
 bool FineGrainedList<T>::empty() const {
-    return list_size == 0;
+    return list_size.load() == 0;
 }
 
 template <class T>
 int FineGrainedList<T>::size() const {
-    return list_size;
+    return list_size.load();
 }
-
 
 template <class T>
 void FineGrainedList<T>::push_back(const T &key) {
-    Node *node = new Node(key);
-    std::scoped_lock<std::mutex> lock(head, tail);
+    std::unique_ptr<Node> node(new Node(key));
+    std::lock_guard<std::mutex> tail_guard(tail->lock);
+    Node *last = tail->prev;
+    std::lock_guard<std::mutex> last_guard(last->lock);
 
-    if (head->next == nullptr) {
-        head->next = node;
-        node->prev = head;
-        tail->prev = node;
-        node->next = tail;
-    } else {
-        tail->prev->next = node;
-        node->prev = tail->prev;
-        tail->prev = node;
-        node->next = tail;
-    }
-    list_size++;
+    node->prev = last;
+    node->next = tail;
+    last->next = node.get();
+    tail->prev = node.release();
+    ++list_size;
 }
 
 template <class T>
 void FineGrainedList<T>::pop_back() {
-    std::scoped_lock<std::mutex> lock(head, tail);
-
-    if (head->next && tail->prev) {
-        if (head->next == tail->prev) {
-            delete head->next;
-            head->next = nullptr;
-            tail- = nullptr;
-        } else {
-            Node *itr = tail;
-            tail = tail->prev;
-            tail->next = nullptr;
-            delete itr;
-        }
-        list_size--;
+    std::lock_guard<std::mutex> tail_guard(tail->lock);
+    Node *last = tail->prev;
+    if (last == head) {
+        return;
     }
+
+    Node *pred = last->prev;
+    std::lock_guard<std::mutex> pred_guard(pred->lock);
+    std::unique_lock<std::mutex> last_guard(last->lock);
+    pred->next = tail;
+    tail->prev = pred;
+    --list_size;
+    last_guard.unlock();
+    delete last;
 }
 
 template <class T>
 void FineGrainedList<T>::print_forwards() {
-    Node *itr = head;
-    while (itr) {
-        std::cout << itr->key << " ";
-        itr = itr->next;
+    Node *curr = head;
+    std::unique_lock<std::mutex> guard(curr->lock);
+    while (curr->next != tail) {
+        Node *next = curr->next;
+        std::unique_lock<std::mutex> next_guard(next->lock);
+        guard.unlock();
+        curr = next;
+        guard = std::move(next_guard);
+        std::cout << curr->key << " ";
     }
     std::cout << std::endl;
 }
 
 template <class T>
 void FineGrainedList<T>::print_backwards() {
-    Node *itr = tail;
-    while (itr) {
-        std::cout << itr->key << " ";
-        itr = itr->prev;
+    // Reverse lock acquisition would deadlock with forward readers/writers.
+    std::vector<T> keys;
+    {
+        Node *curr = head;
+        std::unique_lock<std::mutex> guard(curr->lock);
+        while (curr->next != tail) {
+            Node *next = curr->next;
+            std::unique_lock<std::mutex> next_guard(next->lock);
+            guard.unlock();
+            curr = next;
+            guard = std::move(next_guard);
+            keys.push_back(curr->key);
+        }
+    }
+    for (auto itr = keys.rbegin(); itr != keys.rend(); ++itr) {
+        std::cout << *itr << " ";
     }
     std::cout << std::endl;
 }
 
 template <class T>
 void FineGrainedList<T>::delete_list() {
-    Node *itr = head;
-    while (itr) {
-        head = head->next;
-        head->prev = nullptr;
-        delete itr;
-        list_size--;
-        itr = head;
+    Node *curr = head;
+    while (curr) {
+        Node *next = curr->next;
+        delete curr;
+        curr = next;
     }
     head = nullptr;
     tail = nullptr;
+    list_size = 0;
 }

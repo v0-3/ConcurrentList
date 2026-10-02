@@ -6,8 +6,9 @@
  * **********************************************************************/
 #pragma once
 
-#include <climits>
 #include <iostream>
+#include <memory>
+#include <new>
 
 #include "AtomicMarkableReference.hpp"
 
@@ -16,202 +17,170 @@ class LockFreeList {
    public:
     LockFreeList();
     ~LockFreeList();
+    LockFreeList(const LockFreeList &) = delete;
+    LockFreeList &operator=(const LockFreeList &) = delete;
     bool contains(T);
     bool add(T);
     bool remove(T);
     void printList();
+    // Requires no concurrent operations, just like destruction.
     void deleteList();
 
    private:
     struct Node {
         T key;
-        AtomicMarkableReference<Node> *next;
-        Node() {
-            key = {};
-            next = new AtomicMarkableReference<Node>;
-        }
-        Node(T myKey) {
-            key = myKey;
-            next = new AtomicMarkableReference<Node>;
-        }
+        AtomicMarkableReference<Node> next;
+        Node *ownedNext;
+
+        Node() : key(), next(), ownedNext(nullptr) {}
+        Node(const T &key, Node *next)
+            : key(key), next(next, false), ownedNext(nullptr) {}
     };
 
     struct Window {
         Node *pred;
         Node *curr;
-        Window(Node *myPred, Node *myCurr) {
-            pred = myPred;
-            curr = myCurr;
-        }
 
-        /*
-         * Creates a structure containing the nodes on either side of
-         * the key. It removes marked nodes when it encounters them.
-         */
-        Window(Node *head, int key) {
-            pred = NULL;
-            curr = NULL;
-            Node *succ = NULL;
-
-            bool *marked = new bool;
-            bool snip;
-
+        // Find adjacent nodes, helping unlink any logically removed nodes.
+        Window(Node *head, Node *tail, const T &key) {
         RETRY:
+            pred = head;
+            curr = pred->next.getReference();
             while (true) {
-                pred = head;
-                curr = pred->next->getReference();
-                while (true) {
-                    succ = curr->next->get(marked);
-                    while (marked[0]) {
-                        snip = pred->next->CAS(curr, succ, false, false);
-                        if (!snip)
-                            goto RETRY;
-                        curr = succ;
-                        succ = curr->next->get(marked);
+                bool marked = false;
+                Node *succ = curr->next.get(&marked);
+                while (marked) {
+                    if (!pred->next.CAS(curr, succ, false, false)) {
+                        goto RETRY;
                     }
-                    if (curr->key >= key) {
-                        Window(pred, curr);
-                        return;
-                    }
-                    pred = curr;
                     curr = succ;
+                    succ = curr->next.get(&marked);
                 }
+                if (curr == tail || curr->key >= key) {
+                    return;
+                }
+                pred = curr;
+                curr = succ;
             }
         }
     };
     Node *head;
     Node *tail;
+    // Own every published node, including nodes unlinked by helper threads.
+    // Readers may still hold those nodes until a quiescent clear/destruction.
+    std::atomic<Node *> owned;
+    void own(Node *);
+    void delete_nodes();
 };
 
-/*
- * Initialize class variables
- * Head and tail will be used as a sentinel nodes
- */
 template <class T>
-LockFreeList<T>::LockFreeList() {
-    head = new Node(INT_MIN);
-
-    tail = new Node(INT_MAX);
-
-    /* Set next of head to tail
-     * and next of tail will be NULL, false due to default constructors */
-    head->next->set(tail, false);
+LockFreeList<T>::LockFreeList() : owned(nullptr) {
+    std::unique_ptr<Node> first(new Node());
+    std::unique_ptr<Node> last(new Node());
+    first->next.set(last.get(), false);
+    head = first.release();
+    tail = last.release();
 }
 
-/*
- * Deallocate linked list memory
- */
 template <class T>
 LockFreeList<T>::~LockFreeList() {
-    deleteList();
-
+    delete_nodes();
     delete head;
     delete tail;
 }
 
-/*
- * This wait-free contains method is almost the same as the Lazy
- * Synchronization method. It checks if the given parameter is in the linked
- * list. If found, return true, else return false. The only small differance
- * is it calls curr->next->get(marked) to test whether curr is marked.
- */
 template <class T>
 bool LockFreeList<T>::contains(T key) {
-    bool *marked = new bool;
-
-    Node *curr = head;
-    while (curr->key < key) {
-        curr = curr->next->getReference();
-        curr->next->get(marked);
+    Node *curr = head->next.getReference();
+    while (curr != tail && curr->key < key) {
+        curr = curr->next.getReference();
     }
-
-    return (curr->key == key && !marked[0]);
+    if (curr == tail || !(curr->key == key)) {
+        return false;
+    }
+    bool marked = false;
+    curr->next.get(&marked);
+    return !marked;
 }
 
-/*
- * The add method creates a window to locate pred and curr. It adds a new
- * node only if pred is unmarked and refers to curr.
- */
 template <class T>
 bool LockFreeList<T>::add(T key) {
     while (true) {
-        Window window(head, key);
+        Window window(head, tail, key);
         Node *pred = window.pred;
         Node *curr = window.curr;
-        if (curr->key == key) {
+        if (curr != tail && curr->key == key) {
             return false;
-        } else {
-            Node *node = new Node(key);
-            node->next->set(curr, false);
-            if (pred->next->CAS(curr, node, false, false)) {
-                return true;
-            }
         }
-    }
-}
-
-/*
- * The remove method creates a window to locate pred and curr, and atomically
- * marks the node for removal.
- */
-template <class T>
-bool LockFreeList<T>::remove(T key) {
-    bool snip = false;
-
-    while (true) {
-        Window window(head, key);
-        Node *pred = window.pred;
-        Node *curr = window.curr;
-        if (curr->key != key) {
-            return false;
-        } else {
-            Node *succ = curr->next->getReference();
-
-            snip = curr->next->attemptMark(succ, true);
-            if (!snip)
-                continue;
-            pred->next->CAS(curr, succ, false, false);
+        std::unique_ptr<Node> node(new Node(key, curr));
+        if (pred->next.CAS(curr, node.get(), false, false)) {
+            own(node.release());
             return true;
         }
     }
 }
 
-/*
- * Display contents of linked list
- */
 template <class T>
-void LockFreeList<T>::printList() {
-    // Set curr to head->next since head is a sentinel node
-    Node *curr = head;
-
-    // Traverse linked list and display contents
-    while (curr != NULL) {
-        cout << curr->key << " ";
-        curr = curr->next->getReference();
+bool LockFreeList<T>::remove(T key) {
+    while (true) {
+        Window window(head, tail, key);
+        Node *pred = window.pred;
+        Node *curr = window.curr;
+        if (curr == tail || !(curr->key == key)) {
+            return false;
+        }
+        Node *succ = curr->next.getReference();
+        // Only the thread that changes false to true successfully removes it.
+        if (!curr->next.CAS(succ, succ, false, true)) {
+            continue;
+        }
+        try {
+            pred->next.CAS(curr, succ, false, false);
+        } catch (const std::bad_alloc &) {
+            // Removal already committed; a later search can finish unlinking.
+        }
+        return true;
     }
 }
 
-/*
- * Delete contents of linked list
- */
+template <class T>
+void LockFreeList<T>::printList() {
+    // Concurrent updates may be observed; this is not an atomic snapshot.
+    Node *curr = head->next.getReference();
+    while (curr != tail) {
+        bool marked = false;
+        Node *next = curr->next.get(&marked);
+        if (!marked) {
+            std::cout << curr->key << " ";
+        }
+        curr = next;
+    }
+}
+
+template <class T>
+void LockFreeList<T>::own(Node *node) {
+    node->ownedNext = owned.load();
+    while (!owned.compare_exchange_weak(node->ownedNext, node)) {
+    }
+}
+
+template <class T>
+void LockFreeList<T>::delete_nodes() {
+    Node *curr = owned.exchange(nullptr);
+    while (curr) {
+        Node *next = curr->ownedNext;
+        delete curr;
+        curr = next;
+    }
+}
+
 template <class T>
 void LockFreeList<T>::deleteList() {
-    Node *temp;
-
-    while (head->next->getReference() != tail) {
-        temp = head->next->getReference();
-        head->next = temp->next;
-        delete temp;
-    }
-
+    // Replacing the head also reclaims its accumulated atomic snapshots.
+    // Allocate first so a failed allocation leaves the original list intact.
+    std::unique_ptr<Node> first(new Node());
+    first->next.set(tail, false);
+    delete_nodes();
     delete head;
-    delete tail;
-
-    head = new Node(INT_MIN);
-
-    tail = new Node(INT_MAX);
-
-    /* Set next of head to tail
-     * and next of tail will be NULL, false due to default constructors */
-    head->next->set(tail, false);
+    head = first.release();
 }
