@@ -1,79 +1,106 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 
 template <class T>
 struct MarkableReference {
-    T* next;
+    T *next;
     bool marked;
 
     MarkableReference() : next(nullptr), marked(false) {}
+    MarkableReference(T *node, bool mark) : next(node), marked(mark) {}
 
-    MarkableReference(T* node, bool mark) : next(node), marked(mark) {}
-
-    bool operator==(const MarkableReference<T>& other) {
-        return (next == other.next && marked == other.marked);
+    bool operator==(const MarkableReference<T> &other) const {
+        return next == other.next && marked == other.marked;
     }
 };
 
 template <class T>
 class AtomicMarkableReference {
    private:
-    // Since a pointer is always a POD type, even if T is of non-pod type
-    // atomicity will be maintained
-    std::atomic<MarkableReference<T>*> markedNext;
+    struct State : MarkableReference<T> {
+        State *previous;
+        State(T *node, bool mark, State *previous)
+            : MarkableReference<T>(node, mark), previous(previous) {}
+    };
+
+    // Immutable snapshots keep concurrent readers safe and prevent pointer ABA.
+    // Reclaim the history only when no callers can still hold a snapshot.
+    std::atomic<State *> markedNext;
 
    public:
-    AtomicMarkableReference() {
-        markedNext.store(new MarkableReference<T>(nullptr, false));
+    AtomicMarkableReference() : markedNext(new State(nullptr, false, nullptr)) {}
+    AtomicMarkableReference(T *nextNode, bool mark)
+        : markedNext(new State(nextNode, mark, nullptr)) {}
+
+    ~AtomicMarkableReference() {
+        State *curr = markedNext.load();
+        while (curr) {
+            State *previous = curr->previous;
+            delete curr;
+            curr = previous;
+        }
     }
 
-    AtomicMarkableReference(T* nextNode, bool mark) {
-        // Atomically store the values
-        markedNext.store(new MarkableReference<T>(nextNode, mark));
-    }
+    AtomicMarkableReference(const AtomicMarkableReference &) = delete;
+    AtomicMarkableReference &operator=(const AtomicMarkableReference &) = delete;
 
-    // Returns the reference. load() is atomic and hence that will be the linearization point
-    T* getReference() {
+    T *getReference() const {
         return markedNext.load()->next;
     }
 
-    // Returns the reference and update bool in the reference passed as the argument
-    // load() is atomic and hence that will be the linearization point.
-    T* get(bool* mark) {
-        MarkableReference<T>* temp = markedNext.load();
-        *mark = temp->marked;
-        return temp->next;
+    T *get(bool *mark) const {
+        State *curr = markedNext.load();
+        *mark = curr->marked;
+        return curr->next;
     }
 
-    // Set the variables unconditionally. load() is atomic and hence that will be the linearization point
-    void set(T* newRef, bool newMark) {
-        MarkableReference<T>* curr = markedNext.load();
-
-        if (newRef != curr->next || newMark != curr->marked) {
-            markedNext.store(new MarkableReference<T>(newRef, newMark));
+    void set(T *newRef, bool newMark) {
+        State *curr = markedNext.load();
+        if (newRef == curr->next && newMark == curr->marked) {
+            return;
         }
+        std::unique_ptr<State> next(new State(newRef, newMark, curr));
+        do {
+            if (newRef == curr->next && newMark == curr->marked) {
+                return;
+            }
+            next->previous = curr;
+        } while (!markedNext.compare_exchange_weak(curr, next.get()));
+        next.release();
     }
 
-    // Tests an expected reference value and if the test succeeds,
-    // replaces it with a new mark value
-    bool attemptMark(T* expected, bool newMark) {
-        MarkableReference<T>* curr = markedNext.load();
-
-        if (expected == curr->next) {
-            markedNext.store(new MarkableReference<T>(expected, newMark));
+    // A failed CAS must not overwrite a concurrently changed reference.
+    bool attemptMark(T *expected, bool newMark) {
+        State *curr = markedNext.load();
+        if (expected != curr->next) {
+            return false;
+        }
+        if (newMark == curr->marked) {
             return true;
         }
-        return false;
+        std::unique_ptr<State> next(new State(expected, newMark, curr));
+        if (!markedNext.compare_exchange_strong(curr, next.get())) {
+            return false;
+        }
+        next.release();
+        return true;
     }
 
-    // CAS with reference and the marked field. load() is atomic and hence that will be the linearization point.
-    // Takes advantage of the fact that C++ has short-circuiting hence
-    // if one of the first 2 conditions is false the atomic_compare_exchange_strong will not happen
-    bool CAS(T* expected, T* newValue, bool expectedBool, bool newBool) {
-        MarkableReference<T>* curr = markedNext.load();
-        return (expected == curr->next && expectedBool == curr->marked &&
-                ((newValue == curr->next && newBool == curr->marked) ||
-                 markedNext.compare_exchange_strong(curr, new MarkableReference<T>(newValue, newBool))));
+    bool CAS(T *expected, T *newValue, bool expectedBool, bool newBool) {
+        State *curr = markedNext.load();
+        if (expected != curr->next || expectedBool != curr->marked) {
+            return false;
+        }
+        if (newValue == curr->next && newBool == curr->marked) {
+            return true;
+        }
+        std::unique_ptr<State> next(new State(newValue, newBool, curr));
+        if (!markedNext.compare_exchange_strong(curr, next.get())) {
+            return false;
+        }
+        next.release();
+        return true;
     }
 };

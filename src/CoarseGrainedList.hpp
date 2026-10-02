@@ -10,7 +10,9 @@
  * **********************************************************************/
 #pragma once
 
+#include <cstddef>
 #include <mutex>
+#include <ostream>
 
 template <class T>
 class CoarseGrainedList {
@@ -33,14 +35,13 @@ class CoarseGrainedList {
 
         Node *itr = head;
         while (itr) {
-            head = head->next;
-            head->prev = nullptr;
+            Node *next = itr->next;
             delete itr;
-            list_size--;
-            itr = head;
+            itr = next;
         }
         head = nullptr;
         tail = nullptr;
+        list_size = 0;
     }
 
    public:

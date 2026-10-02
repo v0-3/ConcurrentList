@@ -2,21 +2,15 @@
  * Luis Maya Aranda
  *
  * Lazy Synchronization Linked List
- * The next step is to refine the Optimistic Synchronization algorithm so
- * that contains() calls are wait-free, and add() and remove() methods,
- * while still blocking, traverse the list only once(in the absence of
- * contention). We add to each node a Boolean marked field indicating
- * whether that node is in the set. Now, traversals do not need to lock
- * the target node, and there is no need to validate that the node is reachable
- * by retraversing the whole list. Instead, the algorithm maintains the
- * invariant that every unmarked node is reachable. If a traversing
- * thread does not find a node, or finds it marked, then the item is not
- * in the set.
+ * Traversals use atomic links. Updates lock adjacent nodes and validate
+ * that neither has been logically removed before changing their links.
  *
  * **********************************************************************/
 #pragma once
 
+#include <atomic>
 #include <iostream>
+#include <memory>
 #include <mutex>
 
 template <class T>
@@ -24,243 +18,138 @@ class LazyList {
    public:
     LazyList();
     ~LazyList();
+    LazyList(const LazyList &) = delete;
+    LazyList &operator=(const LazyList &) = delete;
     bool contains(T);
     bool add(T);
     bool remove(T);
     void printList();
+    // Requires no concurrent operations, just like destruction.
     void deleteList();
 
    private:
     struct Node {
         T key;
-        bool marked;
-        Node *next;
-        mutex lock;
+        std::atomic<bool> marked;
+        std::atomic<Node *> next;
+        std::mutex lock;
+        Node *ownedNext;
+
+        Node() : key(), marked(false), next(nullptr), ownedNext(nullptr) {}
+        Node(const T &key, Node *next)
+            : key(key), marked(false), next(next), ownedNext(nullptr) {}
     };
     Node *head;
     Node *tail;
+    // Keep unlinked nodes alive for readers until a quiescent clear/destruction.
+    std::atomic<Node *> owned;
+    void own(Node *);
     bool validate(Node *, Node *);
 };
 
-/*************************************************************************
- * Initialize class variables
- * Head and tail will be used as a sentinel nodes
- * **********************************************************************/
 template <class T>
-LazyList<T>::LazyList() {
-    head = new Node;
-    head->key = {};
-    head->marked = false;
-
-    tail = new Node;
-    tail->key = {};
-    tail->marked = false;
-    tail->next = NULL;
-
-    head->next = tail;
+LazyList<T>::LazyList() : owned(nullptr) {
+    std::unique_ptr<Node> first(new Node());
+    std::unique_ptr<Node> last(new Node());
+    first->next.store(last.get());
+    head = first.release();
+    tail = last.release();
 }
 
-/*************************************************************************
- * Deallocate linked list memory
- * **********************************************************************/
 template <class T>
 LazyList<T>::~LazyList() {
     deleteList();
-
     delete head;
     delete tail;
 }
 
-/*************************************************************************
- * Uses Lazy Synchronization to check if the given parameter is in
- * the linked list. If found, return true, else return false.
- * **********************************************************************/
 template <class T>
 bool LazyList<T>::contains(T key) {
-    // Set curr to head node
-    Node *curr = head;
-
-    // While not at the of the linked list
-    while (curr != tail) {
-        // If current key is >= key, break out of traversal
-        if (curr->key >= key)
-            break;
-
-        // Set curr to next node
-        curr = curr->next;
+    Node *curr = head->next.load();
+    while (curr != tail && !(curr->key >= key)) {
+        curr = curr->next.load();
     }
-
-    // If key is found and curr is not marked, return true
-    return (curr->key == key && !curr->marked);
+    return curr != tail && curr->key == key && !curr->marked.load();
 }
 
-/*************************************************************************
- * Uses Lazy Synchronization to attempt to add the given parameter.
- * If the parameter is already in the linked list, do not add again and
- * return false. If parameter is not already in the linked list, add node
- * and return true.
- * **********************************************************************/
 template <class T>
 bool LazyList<T>::add(T key) {
     while (true) {
         Node *pred = head;
-        Node *curr = head->next;
-
-        // While not at the of the linked list
-        while (curr != tail) {
-            // If current key is >= key, break out of traversal
-            if (curr->key >= key)
-                break;
-
-            // Set pred to curr node
+        Node *curr = pred->next.load();
+        while (curr != tail && !(curr->key >= key)) {
             pred = curr;
-
-            // Set curr to next node
-            curr = curr->next;
+            curr = curr->next.load();
         }
 
-        // Acquire pred and curr locks
-        pred->lock.lock();
-        curr->lock.lock();
-
-        // Validate we locked correct nodes
+        std::lock_guard<std::mutex> pred_guard(pred->lock);
+        std::lock_guard<std::mutex> curr_guard(curr->lock);
         if (validate(pred, curr)) {
-            // If valid & key is found in list, release locks and return false
             if (curr != tail && curr->key == key) {
-                pred->lock.unlock();
-                curr->lock.unlock();
                 return false;
             }
-            // Else, add key to list, release locks and return true
-            else {
-                Node *node = new Node;
-                node->key = key;
-                node->marked = false;
-                node->next = curr;
-                pred->next = node;
-
-                pred->lock.unlock();
-                curr->lock.unlock();
-
-                return true;
-            }
+            Node *node = new Node(key, curr);
+            own(node);
+            pred->next.store(node);
+            return true;
         }
-        // Validation failed, release locks and retry
-        pred->lock.unlock();
-        curr->lock.unlock();
     }
 }
 
-/*************************************************************************
- * Uses Lazy Synchronization to attempt to remove the give parameter.
- * If the parameter is not found in the linked list, return false. If the
- * parameter is found in the linked list, remove it and return true.
- * **********************************************************************/
 template <class T>
 bool LazyList<T>::remove(T key) {
     while (true) {
         Node *pred = head;
-        Node *curr = head->next;
-
-        // While not at the of the linked list
-        while (curr != tail) {
-            // If current key is >= key, break out of traversal
-            if (curr->key >= key)
-                break;
-
-            // Set pred to curr node
+        Node *curr = pred->next.load();
+        while (curr != tail && !(curr->key >= key)) {
             pred = curr;
-
-            // Set curr to next node
-            curr = curr->next;
+            curr = curr->next.load();
         }
 
-        // Acquire pred and curr locks
-        pred->lock.lock();
-        curr->lock.lock();
-
-        // Validate we locked correct nodes
+        std::lock_guard<std::mutex> pred_guard(pred->lock);
+        std::lock_guard<std::mutex> curr_guard(curr->lock);
         if (validate(pred, curr)) {
-            // If valid & key is not found in list, release locks and return false
-            if (curr != tail && curr->key != key) {
-                pred->lock.unlock();
-                curr->lock.unlock();
+            if (curr == tail || !(curr->key == key)) {
                 return false;
             }
-            // Else, remove key from list, release locks and return true
-            else {
-                // Node *temp = curr;
-
-                // Logical removal
-                curr->marked = true;
-
-                // Physical removal
-                pred->next = curr->next;
-
-                // delete temp;
-
-                pred->lock.unlock();
-                curr->lock.unlock();
-                return true;
-            }
+            curr->marked.store(true);
+            pred->next.store(curr->next.load());
+            return true;
         }
-        // Validation failed, release locks and retry
-        pred->lock.unlock();
-        curr->lock.unlock();
     }
 }
 
-/*************************************************************************
- * Display contents of linked list
- * **********************************************************************/
 template <class T>
 void LazyList<T>::printList() {
-    // Acquire head lock
-    head->lock.lock();
-
-    // Set curr to head->next since head is a sentinel node
-    Node *curr = head->next;
-
-    // Traverse linked list and display contents
+    // Concurrent updates may be observed; this is not an atomic snapshot.
+    Node *curr = head->next.load();
     while (curr != tail) {
-        cout << curr->key << " ";
-        curr = curr->next;
+        if (!curr->marked.load()) {
+            std::cout << curr->key << " ";
+        }
+        curr = curr->next.load();
     }
-
-    // Release head lock
-    head->lock.unlock();
 }
 
-/*************************************************************************
- * Validation checks that neither the pred nor curr nodes have been logically
- * deleted, and that pred points to curr.
- * **********************************************************************/
 template <class T>
 bool LazyList<T>::validate(Node *pred, Node *curr) {
-    return (!pred->marked && !curr->marked && pred->next == curr);
+    return !pred->marked.load() && !curr->marked.load() && pred->next.load() == curr;
 }
 
-/*************************************************************************
- * Delete contents of linked list
- * **********************************************************************/
+template <class T>
+void LazyList<T>::own(Node *node) {
+    node->ownedNext = owned.load();
+    while (!owned.compare_exchange_weak(node->ownedNext, node)) {
+    }
+}
+
 template <class T>
 void LazyList<T>::deleteList() {
-    Node *temp;
-
-    while (head->next != tail) {
-        temp = head->next;
-        head->next = temp->next;
-        delete temp;
+    head->next.store(tail);
+    Node *curr = owned.exchange(nullptr);
+    while (curr) {
+        Node *next = curr->ownedNext;
+        delete curr;
+        curr = next;
     }
-
-    head = new Node;
-    head->key = {};
-    head->marked = false;
-
-    tail = new Node;
-    tail->key = {};
-    tail->marked = false;
-    tail->next = NULL;
-
-    head->next = tail;
 }

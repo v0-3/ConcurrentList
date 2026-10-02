@@ -2,19 +2,15 @@
  * Luis Maya Aranda
  *
  * Optimistic Synchronization Linked List
- * Although fine-grained locking is an improvement over single, coarse-grained
- * lock, it still imposes a potentially long sequence of lock acquisitions
- * and releases. Moreover, threads accessing disjoint parts of the list may
- * still block one another. One way to reduce synchronization costs is to:
- * search without acquiring locks, lock the nodes found, then confirm that
- * the locked nodes are correct. If a synchronization conflict causes the wrong
- * nodes to be locked, then release the locks and start over. Normally this
- * kind of conflict is rare.
+ * Search without locking, lock the adjacent nodes, then validate that
+ * they are still adjacent and reachable before completing an operation.
  *
  * **********************************************************************/
 #pragma once
 
+#include <atomic>
 #include <iostream>
+#include <memory>
 #include <mutex>
 
 template <class T>
@@ -22,265 +18,149 @@ class OptimisticList {
    public:
     OptimisticList();
     ~OptimisticList();
+    OptimisticList(const OptimisticList &) = delete;
+    OptimisticList &operator=(const OptimisticList &) = delete;
     bool contains(T);
     bool add(T);
     bool remove(T);
     void printList();
+    // Requires no concurrent operations, just like destruction.
     void deleteList();
 
    private:
     struct Node {
         T key;
-        Node *next;
-        mutex lock;
+        std::atomic<Node *> next;
+        std::mutex lock;
+        Node *ownedNext;
+
+        Node() : key(), next(nullptr), ownedNext(nullptr) {}
+        Node(const T &key, Node *next) : key(key), next(next), ownedNext(nullptr) {}
     };
     Node *head;
     Node *tail;
+    // Keep unlinked nodes alive for readers until a quiescent clear/destruction.
+    std::atomic<Node *> owned;
+    void own(Node *);
     bool validate(Node *, Node *);
 };
 
-/*************************************************************************
- * Initialize class variables
- * Head and tail will be used as a sentinel nodes
- * **********************************************************************/
 template <class T>
-OptimisticList<T>::OptimisticList() {
-    head = new Node;
-    head->key = {};
-
-    tail = new Node;
-    tail->key = {};
-    tail->next = NULL;
-
-    head->next = tail;
+OptimisticList<T>::OptimisticList() : owned(nullptr) {
+    std::unique_ptr<Node> first(new Node());
+    std::unique_ptr<Node> last(new Node());
+    first->next.store(last.get());
+    head = first.release();
+    tail = last.release();
 }
 
-/*************************************************************************
- * Deallocate linked list memory
- * **********************************************************************/
 template <class T>
 OptimisticList<T>::~OptimisticList() {
     deleteList();
-
     delete head;
     delete tail;
 }
 
-/*************************************************************************
- * Uses Optimistic Synchronization to check if the given parameter is in
- * the linked list. If found, return true, else return false.
- * **********************************************************************/
 template <class T>
 bool OptimisticList<T>::contains(T key) {
     while (true) {
         Node *pred = head;
-        Node *curr = head->next;
-
-        // While not at the of the linked list
-        while (curr != tail) {
-            // If current key is >= key, break out of traversal
-            if (curr->key >= key)
-                break;
-
-            // Set pred to curr node
+        Node *curr = pred->next.load();
+        while (curr != tail && !(curr->key >= key)) {
             pred = curr;
-
-            // Set curr to next node
-            curr = curr->next;
+            curr = curr->next.load();
         }
 
-        // Acquire pred and curr locks
-        pred->lock.lock();
-        curr->lock.lock();
-
-        // Validate we locked correct nodes
+        std::lock_guard<std::mutex> pred_guard(pred->lock);
+        std::lock_guard<std::mutex> curr_guard(curr->lock);
         if (validate(pred, curr)) {
-            // If valid, release pred and curr locks
-            pred->lock.unlock();
-            curr->lock.unlock();
-
-            // Return true if key was found
-            return (curr->key == key);
+            return curr != tail && curr->key == key;
         }
-        // Validation failed, release locks and retry
-        pred->lock.unlock();
-        curr->lock.unlock();
     }
 }
 
-/*************************************************************************
- * Uses Optimistic Synchronization to attempt to add the given parameter.
- * If the parameter is already in the linked list, do not add again and
- * return false. If parameter is not already in the linked list, add node
- * and return true.
- * **********************************************************************/
 template <class T>
 bool OptimisticList<T>::add(T key) {
     while (true) {
         Node *pred = head;
-        Node *curr = head->next;
-
-        // While not at the of the linked list
-        while (curr != tail) {
-            // If current key is >= key, break out of traversal
-            if (curr->key >= key)
-                break;
-
-            // Set pred to curr node
+        Node *curr = pred->next.load();
+        while (curr != tail && !(curr->key >= key)) {
             pred = curr;
-
-            // Set curr to next node
-            curr = curr->next;
+            curr = curr->next.load();
         }
 
-        // Acquire pred and curr locks
-        pred->lock.lock();
-        curr->lock.lock();
-
-        // Validate we locked correct nodes
+        std::lock_guard<std::mutex> pred_guard(pred->lock);
+        std::lock_guard<std::mutex> curr_guard(curr->lock);
         if (validate(pred, curr)) {
-            // If valid & key is found in list, release locks and return false
             if (curr != tail && curr->key == key) {
-                pred->lock.unlock();
-                curr->lock.unlock();
                 return false;
             }
-            // Else, add key to list, release locks and return true
-            else {
-                Node *node = new Node;
-                node->key = key;
-                node->next = curr;
-                pred->next = node;
-
-                pred->lock.unlock();
-                curr->lock.unlock();
-
-                return true;
-            }
+            Node *node = new Node(key, curr);
+            own(node);
+            pred->next.store(node);
+            return true;
         }
-        // Validation failed, release locks and retry
-        pred->lock.unlock();
-        curr->lock.unlock();
     }
 }
 
-/*************************************************************************
- * Uses Optimistic Synchronization to attempt to remove the give parameter.
- * If the parameter is not found in the linked list, return false. If the
- * parameter is found in the linked list, remove it and return true.
- * **********************************************************************/
 template <class T>
 bool OptimisticList<T>::remove(T key) {
     while (true) {
         Node *pred = head;
-        Node *curr = head->next;
-
-        // While not at the of the linked list
-        while (curr != tail) {
-            // If current key is >= key, break out of traversal
-            if (curr->key >= key)
-                break;
-
-            // Set pred to curr node
+        Node *curr = pred->next.load();
+        while (curr != tail && !(curr->key >= key)) {
             pred = curr;
-
-            // Set curr to next node
-            curr = curr->next;
+            curr = curr->next.load();
         }
 
-        // Acquire pred and curr locks
-        pred->lock.lock();
-        curr->lock.lock();
-
-        // Validate we locked correct nodes
+        std::lock_guard<std::mutex> pred_guard(pred->lock);
+        std::lock_guard<std::mutex> curr_guard(curr->lock);
         if (validate(pred, curr)) {
-            // If valid & key is not found in list, release locks and return false
-            if (curr != tail && curr->key != key) {
-                pred->lock.unlock();
-                curr->lock.unlock();
+            if (curr == tail || !(curr->key == key)) {
                 return false;
             }
-            // Else, remove key from list, release locks and return true
-            else {
-                // Node *temp = curr;
-                pred->next = curr->next;
-                // delete temp;
-
-                pred->lock.unlock();
-                curr->lock.unlock();
-                return true;
-            }
+            pred->next.store(curr->next.load());
+            return true;
         }
-        // Validation failed, release locks and retry
-        pred->lock.unlock();
-        curr->lock.unlock();
     }
 }
 
-/*************************************************************************
- * Display contents of linked list
- * **********************************************************************/
 template <class T>
 void OptimisticList<T>::printList() {
-    // Acquire head lock
-    head->lock.lock();
-
-    // Set curr to head->next since head is a sentinel node
-    Node *curr = head->next;
-
-    // Traverse linked list and display contents
+    // Concurrent updates may be observed; this is not an atomic snapshot.
+    Node *curr = head->next.load();
     while (curr != tail) {
-        cout << curr->key << " ";
-        curr = curr->next;
+        std::cout << curr->key << " ";
+        curr = curr->next.load();
     }
-
-    // Release head lock
-    head->lock.unlock();
 }
 
-/*************************************************************************
- * Validation checks that pred points to curr and is reachable from head.
- * **********************************************************************/
 template <class T>
 bool OptimisticList<T>::validate(Node *pred, Node *curr) {
-    // Set node to head
     Node *node = head;
-
-    // While not at the of the linked list
     while (node != tail) {
-        // If node key > pred key, incorrect node, break and return false
-        if (node->key > pred->key)
-            break;
-        // If pred is reachable from head
-        if (node == pred)
-            // Return true if pred points to curr, else false
-            return (pred->next == curr);
-
-        // Update node to next node in list
-        node = node->next;
+        if (node == pred) {
+            return pred->next.load() == curr;
+        }
+        node = node->next.load();
     }
     return false;
 }
 
-/*************************************************************************
- * Delete contents of linked list
- * **********************************************************************/
+template <class T>
+void OptimisticList<T>::own(Node *node) {
+    node->ownedNext = owned.load();
+    while (!owned.compare_exchange_weak(node->ownedNext, node)) {
+    }
+}
+
 template <class T>
 void OptimisticList<T>::deleteList() {
-    Node *temp;
-
-    while (head->next != tail) {
-        temp = head->next;
-        head->next = temp->next;
-        delete temp;
+    head->next.store(tail);
+    Node *curr = owned.exchange(nullptr);
+    while (curr) {
+        Node *next = curr->ownedNext;
+        delete curr;
+        curr = next;
     }
-
-    head = new Node;
-    head->key = {};
-
-    tail = new Node;
-    tail->key = {};
-    tail->next = NULL;
-
-    head->next = tail;
 }
